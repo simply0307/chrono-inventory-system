@@ -1,33 +1,36 @@
 import React, { useMemo, useState } from "react";
 import Papa from "papaparse";
-import * as XLSX from "xlsx";
 import { AlertTriangle, Check, Download, FileSpreadsheet, HardDrive, Search, Upload } from "lucide-react";
 import {
   FIELD_DEFINITIONS,
+  assessReadiness,
+  auditPostAllocationResults,
   chooseManualMatch,
   getMappingWarnings,
   inferMapping,
   matchBatchRows,
   normalizeBatchRow,
   normalizeInventoryRow,
+  normalizePhysicalInventoryRow,
   summarize,
 } from "./matching.js";
 import { buildCorrectedBatchRows, buildCorrectedColumns } from "./correctedExport.js";
 import { DEFAULT_LOCATION_SETTINGS, assignLocationsToBatch } from "./inventoryState.js";
+import { parseTabularFile } from "./tabular.js";
 
 export default function App() {
   const [referenceImport, setReferenceImport] = useState(emptyImport("inventory"));
   const [batchImport, setBatchImport] = useState(emptyImport("batch"));
+  const [physicalInventoryImport, setPhysicalInventoryImport] = useState(emptyImport("physical_inventory"));
   const [referenceRows, setReferenceRows] = useState([]);
   const [batchRows, setBatchRows] = useState([]);
+  const [physicalInventoryRows, setPhysicalInventoryRows] = useState([]);
   const [locationSettings, setLocationSettings] = useState({
     ...DEFAULT_LOCATION_SETTINGS,
-    box_id: "B001",
-    starting_section_number: 1,
-    cards_per_section: 100,
-    use_import_sequence: true,
-    regenerate_locations: false,
+    allocation_mode: "",
+    settings_confirmed: false,
   });
+  const [identityOptions, setIdentityOptions] = useState({ batch_language_assumption: "" });
   const [results, setResults] = useState([]);
   const [activeFilter, setActiveFilter] = useState("all");
   const [query, setQuery] = useState("");
@@ -47,6 +50,10 @@ export default function App() {
       return statusMatch && textMatch;
     });
   }, [activeFilter, query, results]);
+  const readiness = useMemo(
+    () => assessReadiness({ referenceImport, batchImport, physicalInventoryImport, referenceRows, batchRows, physicalInventoryRows, results, locationSettings, identityOptions }),
+    [referenceImport, batchImport, physicalInventoryImport, referenceRows, batchRows, physicalInventoryRows, results, locationSettings, identityOptions],
+  );
 
   async function handleImport(kind, file) {
     if (!file) return;
@@ -64,9 +71,12 @@ export default function App() {
       if (kind === "inventory") {
         setReferenceImport(nextImport);
         setReferenceRows(normalizeRows("inventory", nextImport));
-      } else {
+      } else if (kind === "batch") {
         setBatchImport(nextImport);
         setBatchRows(normalizeRows("batch", nextImport));
+      } else {
+        setPhysicalInventoryImport(nextImport);
+        setPhysicalInventoryRows(normalizeRows("physical_inventory", nextImport));
       }
       setResults([]);
       setMessage("");
@@ -76,21 +86,30 @@ export default function App() {
   }
 
   function updateMapping(kind, fieldKey, column) {
-    const setter = kind === "inventory" ? setReferenceImport : setBatchImport;
+    const setter = kind === "inventory" ? setReferenceImport : kind === "batch" ? setBatchImport : setPhysicalInventoryImport;
     setter((current) => {
       const mapping = { ...current.mapping, [fieldKey]: column };
       const next = { ...current, mapping, warnings: getMappingWarnings(current.headers, mapping, kind) };
       if (kind === "inventory") setReferenceRows(normalizeRows("inventory", next));
-      else setBatchRows(normalizeRows("batch", next));
+      else if (kind === "batch") setBatchRows(normalizeRows("batch", next));
+      else setPhysicalInventoryRows(normalizeRows("physical_inventory", next));
       setResults([]);
       return next;
     });
   }
 
   function generateLocations() {
-    const assigned = assignLocationsToBatch(batchRows, [], [], locationSettings);
+    const assigned = assignLocationsToBatch(batchRows, physicalInventoryRows, [], locationSettings);
     setBatchRows(assigned.batchRows);
     setResults([]);
+    if (assigned.blocked) {
+      const reasons = [...(assigned.sequenceIssues || []), ...(assigned.existingInventoryIssues || [])];
+      const detail = reasons.length ? reasons.map((item) => `row ${item.source_row} ${item.message}`).join("; ") : assigned.batchRows[0]?.location_allocation_error;
+      setMessage(`Location allocation blocked: ${detail || "invalid or unconfirmed allocation settings"}`);
+      return;
+    }
+    const identity = matchBatchRows(assigned.batchRows, referenceRows, identityOptions);
+    setResults(auditPostAllocationResults(identity, referenceRows, { allocationSettings: locationSettings, existingInventoryRows: physicalInventoryRows }));
     const capacity = assigned.capacityIssues?.length || 0;
     setMessage(
       capacity
@@ -99,28 +118,37 @@ export default function App() {
     );
   }
 
-  function runMatchAudit() {
-    const nextResults = matchBatchRows(batchRows, referenceRows, {});
+  function runIdentityReconciliation() {
+    if (!readiness.importSchema.ready || !readiness.identityReconciliation.ready) {
+      setMessage("Identity reconciliation is blocked until import/schema readiness passes.");
+      return;
+    }
+    const nextResults = matchBatchRows(batchRows, referenceRows, identityOptions);
     setResults(nextResults);
     setActiveFilter(nextResults.some((result) => result.audit_status === "red") ? "red" : "all");
   }
 
+  function runPostAllocationAudit() {
+    const identity = matchBatchRows(batchRows, referenceRows, identityOptions);
+    const audited = auditPostAllocationResults(identity, referenceRows, { allocationSettings: locationSettings, existingInventoryRows: physicalInventoryRows });
+    setResults(audited);
+    setActiveFilter(audited.some((result) => result.audit_status === "red") ? "red" : "all");
+  }
+
   function selectMatch(resultId, candidate) {
-    setResults((current) => current.map((result) => (result.id === resultId ? chooseManualMatch(result, candidate) : result)));
+    setResults((current) => current.map((result) => (result.id === resultId ? chooseManualMatch(result, candidate, identityOptions) : result)));
   }
 
   function exportCorrected(mode) {
-    const rows = buildCorrectedBatchRows(batchImport, results, mode);
+    const rows = buildCorrectedBatchRows(batchImport, results, mode, referenceRows, { identityOptions, allocationSettings: locationSettings, existingInventoryRows: physicalInventoryRows });
+    if (mode === "verified" && !rows.length) {
+      setMessage("Verified export blocked: independent preflight found zero green rows.");
+      return;
+    }
     const columns = buildCorrectedColumns(batchImport.headers);
-    downloadCsv(`chrono-corrected-batch-${mode}`, rows, columns);
+    const name = mode === "verified" ? "verified-tcgtracking-upload" : "review-required";
+    downloadCsv(name, rows, columns);
   }
-
-  const readiness = {
-    referenceHasIds: referenceRows.some((row) => row.tcgplayer_product_id),
-    batchHasRows: batchRows.length > 0,
-    batchHasNames: batchRows.some((row) => row.card_name),
-    batchHasQty: batchRows.some((row) => Number(row.quantity) > 0),
-  };
 
   return (
     <main>
@@ -132,7 +160,7 @@ export default function App() {
       </header>
 
       <section className="wizard-steps">
-        {["1 Upload files", "2 Confirm mappings", "3 Generate locations", "4 Match, audit, export"].map((step) => (
+        {["1 Upload inputs", "2 Confirm mappings", "3 Reconcile identity", "4 Allocate locations", "5 Audit and export"].map((step) => (
           <span key={step}>{step}</span>
         ))}
       </section>
@@ -143,8 +171,8 @@ export default function App() {
         <SectionHeader icon={<FileSpreadsheet size={20} />} title="Step 1: Upload Files" />
         <section className="workspace-grid">
           <ImportPanel
-            title="TCGplayer Inventory / Reference CSV"
-            description="Lookup file with TCGplayer Product IDs."
+            title="TCGplayer Catalog / Reference"
+            description="Catalog metadata and Product IDs only; never physical inventory state."
             fileName={referenceImport.fileName}
             count={referenceRows.length}
             onImport={(file) => handleImport("inventory", file)}
@@ -156,13 +184,22 @@ export default function App() {
             count={batchRows.length}
             onImport={(file) => handleImport("batch", file)}
           />
+          <ImportPanel
+            title="Existing Physical Inventory (optional)"
+            description="Used only in Append mode; requires valid locations and quantities."
+            fileName={physicalInventoryImport.fileName}
+            count={physicalInventoryRows.length}
+            onImport={(file) => handleImport("physical_inventory", file)}
+          />
         </section>
         <div className="status-grid compact">
-          <MetricCard label="Reference has TCGplayer IDs" value={readiness.referenceHasIds ? "yes" : "no"} />
-          <MetricCard label="Batch has rows" value={readiness.batchHasRows ? "yes" : "no"} />
-          <MetricCard label="Batch has card names" value={readiness.batchHasNames ? "yes" : "no"} />
-          <MetricCard label="Batch has quantities" value={readiness.batchHasQty ? "yes" : "no"} />
+          <MetricCard label="Import/schema" value={readiness.importSchema.ready ? "ready" : "blocked"} />
+          <MetricCard label="Identity reconciliation" value={readiness.identityReconciliation.ready ? "ready" : "blocked"} />
+          <MetricCard label="Allocation mode" value={readiness.allocationMode.ready ? "ready" : "blocked"} />
+          <MetricCard label="Post-allocation audit" value={readiness.postAllocationAudit.ready ? "ready" : "blocked"} />
+          <MetricCard label="Export" value={readiness.exportReadiness.ready ? `${readiness.verifiedCount} ready` : "blocked"} />
         </div>
+        {referenceImport.fileName || batchImport.fileName ? <ReadinessNotices readiness={readiness} /> : null}
       </section>
 
       <section className="section-shell">
@@ -175,35 +212,67 @@ export default function App() {
             onChange={(field, column) => updateMapping("inventory", field, column)}
           />
           <MappingTable title="Batch Mapping" kind="batch" importState={batchImport} onChange={(field, column) => updateMapping("batch", field, column)} />
+          {physicalInventoryImport.fileName ? <MappingTable title="Physical Inventory Mapping" kind="physical_inventory" importState={physicalInventoryImport} onChange={(field, column) => updateMapping("physical_inventory", field, column)} /> : null}
         </div>
       </section>
 
       <section className="section-shell">
-        <SectionHeader icon={<HardDrive size={20} />} title="Step 3: Generate Bnnn-Snnn Locations" />
+        <SectionHeader icon={<Check size={20} />} title="Step 3: Reconcile Catalog Product IDs" />
+        <label>
+          <span>Batch-wide language assumption (optional)</span>
+          <select value={identityOptions.batch_language_assumption} onChange={(event) => { setIdentityOptions({ batch_language_assumption: event.target.value }); setResults([]); }}>
+            <option value="">No assumption</option>
+            <option value="English">English</option>
+            <option value="Japanese">Japanese</option>
+          </select>
+        </label>
+        {readiness.capabilityNotices.map((notice) => <Notice key={notice} tone="warn" text={notice} />)}
+        <div className="button-grid">
+          <button type="button" disabled={!readiness.identityReconciliation.ready} onClick={runIdentityReconciliation}>
+            <Check size={18} />
+            <span>Run Identity Reconciliation</span>
+          </button>
+        </div>
+      </section>
+
+      <section className="section-shell">
+        <SectionHeader icon={<HardDrive size={20} />} title="Step 4: Allocate Bnnn-Snnn Locations" />
         <div className="location-form">
           <label>
+            <span>Allocation mode</span>
+            <select value={locationSettings.allocation_mode} onChange={(event) => setLocationSettings({ ...locationSettings, allocation_mode: event.target.value, settings_confirmed: false })}>
+              <option value="">Select mode</option>
+              <option value="new_empty">New/empty allocation</option>
+              <option value="append_existing">Append to existing inventory</option>
+            </select>
+          </label>
+          <label>
             <span>Box number</span>
-            <input value={locationSettings.box_id} onChange={(event) => setLocationSettings({ ...locationSettings, box_id: normalizeBoxInput(event.target.value) })} />
+            <input value={locationSettings.box_id} onChange={(event) => setLocationSettings({ ...locationSettings, box_id: normalizeBoxInput(event.target.value), settings_confirmed: false })} />
           </label>
           <label>
             <span>Starting section</span>
-            <input type="number" min="1" value={locationSettings.starting_section_number} onChange={(event) => setLocationSettings({ ...locationSettings, starting_section_number: Number(event.target.value) })} />
+            <input type="number" min="1" value={locationSettings.starting_section_number} onChange={(event) => setLocationSettings({ ...locationSettings, starting_section_number: Number(event.target.value), settings_confirmed: false })} />
           </label>
           <label>
             <span>Cards per section</span>
-            <input type="number" min="1" value={locationSettings.cards_per_section} onChange={(event) => setLocationSettings({ ...locationSettings, cards_per_section: Number(event.target.value) })} />
+            <input type="number" min="1" value={locationSettings.cards_per_section} onChange={(event) => setLocationSettings({ ...locationSettings, cards_per_section: Number(event.target.value), settings_confirmed: false })} />
           </label>
           <label className="check-label">
-            <input type="checkbox" checked={locationSettings.use_import_sequence} onChange={(event) => setLocationSettings({ ...locationSettings, use_import_sequence: event.target.checked })} />
+            <input type="checkbox" checked={locationSettings.use_import_sequence} onChange={(event) => setLocationSettings({ ...locationSettings, use_import_sequence: event.target.checked, settings_confirmed: false })} />
             <span>Use Import Sequence</span>
           </label>
           <label className="check-label">
-            <input type="checkbox" checked={!locationSettings.regenerate_locations} onChange={(event) => setLocationSettings({ ...locationSettings, regenerate_locations: !event.target.checked })} />
+            <input type="checkbox" checked={!locationSettings.regenerate_locations} onChange={(event) => setLocationSettings({ ...locationSettings, regenerate_locations: !event.target.checked, settings_confirmed: false })} />
             <span>Preserve existing Bin values</span>
+          </label>
+          <label className="check-label">
+            <input type="checkbox" checked={locationSettings.settings_confirmed} onChange={(event) => setLocationSettings({ ...locationSettings, settings_confirmed: event.target.checked })} />
+            <span>I confirm the mode, Box, starting Section, and capacity</span>
           </label>
         </div>
         <div className="button-grid">
-          <button type="button" disabled={!batchRows.length} onClick={generateLocations}>
+          <button type="button" disabled={!readiness.allocationMode.ready} onClick={generateLocations}>
             <HardDrive size={18} />
             <span>Generate Locations</span>
           </button>
@@ -211,23 +280,20 @@ export default function App() {
       </section>
 
       <section className="section-shell">
-        <SectionHeader icon={<Check size={20} />} title="Step 4: Match, Audit, Export" />
+        <SectionHeader icon={<Check size={20} />} title="Step 5: Post-Allocation Audit and Export" />
+        <Notice tone="warn" text="Chrono preserves every chronological source row and repeated Product ID. Confirm TCGtracking upload compatibility against an authentic accepted template before using the verified file." />
         <div className="button-grid">
-          <button type="button" disabled={!referenceRows.length || !batchRows.length} onClick={runMatchAudit}>
+          <button type="button" disabled={!batchRows.length || !batchRows.every((row) => row.allocation_mode)} onClick={runPostAllocationAudit}>
             <Check size={18} />
-            <span>Run Match & Audit</span>
+            <span>Run Post-Allocation Audit</span>
           </button>
-          <button type="button" disabled={!results.length} onClick={() => exportCorrected("safe")}>
+          <button type="button" disabled={!readiness.exportReadiness.ready} onClick={() => exportCorrected("verified")}>
             <Download size={18} />
-            <span>Export Green/Yellow Rows</span>
+            <span>Verified TCGtracking Upload</span>
           </button>
-          <button type="button" disabled={!results.length} onClick={() => exportCorrected("all")}>
+          <button type="button" disabled={!readiness.postAllocationAudit.ready} onClick={() => exportCorrected("review")}>
             <Download size={18} />
-            <span>Export All Rows</span>
-          </button>
-          <button type="button" disabled={!results.length} onClick={() => exportCorrected("errors")}>
-            <Download size={18} />
-            <span>Export Error/Review Rows</span>
+            <span>Review Required</span>
           </button>
         </div>
         <div className="status-grid">
@@ -273,7 +339,7 @@ function ImportPanel({ title, description, fileName, count, onImport }) {
 
 function MappingTable({ title, kind, importState, onChange }) {
   const fields = FIELD_DEFINITIONS.filter((field) =>
-    ["card_name", "collector_number", "condition", "finish", "language", "rarity", "quantity", "listing_price", "import_sequence", "physical_location_sku", "tcgplayer_product_id", "tcgplayer_sku_id", "set_name"].includes(field.key),
+    ["product_line", "card_name", "set_name", "set_code", "collector_number", "condition", "finish", "language", "rarity", "quantity", "listing_price", "import_sequence", "physical_location_sku", "box_id", "section_number", "tcgplayer_product_id", "tcgplayer_sku_id"].includes(field.key),
   );
   const referenceFinishFromCondition = kind === "inventory" && importState.mapping.condition && !importState.mapping.finish;
   return (
@@ -285,7 +351,7 @@ function MappingTable({ title, kind, importState, onChange }) {
           text={`No separate finish/printing column is mapped. Chrono will parse Foil from ${importState.mapping.condition} and default non-foil rows to Normal.`}
         />
       ) : null}
-      {importState.warnings.slice(0, 4).map((warning) => (
+      {importState.warnings.map((warning) => (
         <Notice key={`${warning.field}-${warning.message}`} tone={warning.level === "red" ? "error" : "warn"} text={warning.message} />
       ))}
       <div className="table-shell">
@@ -341,6 +407,10 @@ function ReviewTable({ results, onSelect }) {
             <th>Qty</th>
             <th>physical_location_sku</th>
             <th>tcgplayer_product_id</th>
+            <th>tcgplayer_sku_id</th>
+            <th>SKU verification</th>
+            <th>Allocation mode</th>
+            <th>Copies in section</th>
             <th>Matched Set</th>
             <th>Status</th>
             <th>Reason / Candidates</th>
@@ -357,7 +427,11 @@ function ReviewTable({ results, onSelect }) {
               <td>{result.row.finish}</td>
               <td>{result.row.quantity}</td>
               <td>{result.row.physical_location_sku}</td>
-              <td>{result.selected?.tcgplayer_product_id || ""}</td>
+              <td>{result.tcgplayer_product_id || result.row.tcgplayer_product_id || ""}</td>
+              <td>{result.sku_verification_status === "verified" ? result.tcgplayer_sku_id : ""}</td>
+              <td>{result.sku_verification_status}</td>
+              <td>{result.allocation_mode || result.row.allocation_mode || ""}</td>
+              <td>{result.duplicate_in_section_count || 1}</td>
               <td>{result.selected?.set_name || ""}</td>
               <td>{result.audit_status}</td>
               <td>
@@ -376,7 +450,7 @@ function ReviewTable({ results, onSelect }) {
           ))}
           {!results.length ? (
             <tr>
-              <td colSpan="12">No audit rows yet.</td>
+              <td colSpan="16">No audit rows yet.</td>
             </tr>
           ) : null}
         </tbody>
@@ -385,56 +459,8 @@ function ReviewTable({ results, onSelect }) {
   );
 }
 
-async function parseTabularFile(file, kind) {
-  const extension = file.name.split(".").pop().toLowerCase();
-  if (extension === "csv" || extension === "tsv") {
-    const text = await file.text();
-    const parsed = Papa.parse(text, {
-      header: true,
-      skipEmptyLines: true,
-      delimiter: extension === "tsv" ? "\t" : "",
-    });
-    if (parsed.errors.length) throw new Error(parsed.errors[0].message);
-    return { headers: parsed.meta.fields || [], rows: parsed.data };
-  }
-  const buffer = await file.arrayBuffer();
-  const workbook = XLSX.read(buffer, { type: "array", cellDates: false });
-  const sheet = workbook.Sheets[chooseSheet(workbook, kind)];
-  return sheetToRows(sheet);
-}
-
-function chooseSheet(workbook, kind) {
-  const preferred = kind === "inventory" ? ["tcg", "reference", "inventory", "export", "Sheet1"] : ["scan", "batch", "chrono", "Sheet1"];
-  return workbook.SheetNames.find((name) => preferred.some((prefix) => name.toLowerCase().includes(prefix.toLowerCase()))) || workbook.SheetNames[0];
-}
-
-function sheetToRows(sheet) {
-  const range = XLSX.utils.decode_range(sheet["!ref"] || "A1:A1");
-  const rawHeaders = [];
-  for (let col = range.s.c; col <= range.e.c; col += 1) {
-    const cell = sheet[XLSX.utils.encode_cell({ r: range.s.r, c: col })];
-    rawHeaders.push(cell?.v == null ? "" : String(cell.v).trim());
-  }
-  let lastHeaderIndex = rawHeaders.length - 1;
-  while (lastHeaderIndex >= 0 && !rawHeaders[lastHeaderIndex]) lastHeaderIndex -= 1;
-  const headers = rawHeaders.slice(0, lastHeaderIndex + 1).filter(Boolean);
-  const rows = [];
-  for (let rowIndex = range.s.r + 1; rowIndex <= range.e.r; rowIndex += 1) {
-    const row = {};
-    let hasValue = false;
-    headers.forEach((header, offset) => {
-      const cell = sheet[XLSX.utils.encode_cell({ r: rowIndex, c: range.s.c + offset })];
-      const value = cell?.v == null ? "" : cell.v;
-      if (value !== "") hasValue = true;
-      row[header] = value;
-    });
-    if (hasValue) rows.push(row);
-  }
-  return { headers, rows };
-}
-
 function normalizeRows(kind, importState) {
-  const normalizer = kind === "inventory" ? normalizeInventoryRow : normalizeBatchRow;
+  const normalizer = kind === "inventory" ? normalizeInventoryRow : kind === "physical_inventory" ? normalizePhysicalInventoryRow : normalizeBatchRow;
   return importState.rows.map((row, index) => normalizer(row, importState.mapping, index, { source_file: importState.fileName }));
 }
 
@@ -459,8 +485,9 @@ function sampleDerivedFinishValues(rows, conditionColumn) {
   for (const row of rows) {
     const rawCondition = String(row[conditionColumn] ?? "").trim();
     if (!rawCondition) continue;
-    const finish = /\bfoil\b/i.test(rawCondition) ? "Foil" : "Normal";
-    const condition = rawCondition.replace(/\bfoil\b/gi, "").trim().replace(/\s+/g, " ") || rawCondition;
+    const finishToken = rawCondition.match(/\b(etched\s+foil|non[- ]?foil|foil)\b/i)?.[0] || "";
+    const finish = /etched/i.test(finishToken) ? "Etched Foil" : /non/i.test(finishToken) || !finishToken ? "Normal" : "Foil";
+    const condition = rawCondition.replace(finishToken, "").trim().replace(/\s+/g, " ") || rawCondition;
     const sample = `${rawCondition} -> ${condition} / ${finish}`;
     if (seen.has(sample)) continue;
     seen.add(sample);
@@ -526,4 +553,17 @@ function Notice({ tone, text }) {
       <span>{text}</span>
     </div>
   );
+}
+
+function ReadinessNotices({ readiness }) {
+  const checks = [
+    ["Import/schema", readiness.importSchema],
+    ["Identity reconciliation", readiness.identityReconciliation],
+    ["Allocation mode", readiness.allocationMode],
+    ["Post-allocation audit", readiness.postAllocationAudit],
+    ["Export", readiness.exportReadiness],
+  ];
+  return checks.flatMap(([label, check]) => check.ready ? [] : check.errors.slice(0, 3).map((error, index) => (
+    <Notice key={`${label}-${index}-${error}`} tone="error" text={`${label} blocked: ${error}`} />
+  )));
 }
